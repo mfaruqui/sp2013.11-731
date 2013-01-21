@@ -5,7 +5,6 @@ name:
 email: cdyer@cs.cmu.edu
 leaderboard: ProfDyer
 languages: [eng,deu]
----
 name:
    first: Manaal
    last: Faruqui
