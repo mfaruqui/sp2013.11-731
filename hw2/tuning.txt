@@ -1,0 +1,12 @@
+Performance tuning on Training data
+
+alpha beta f_score
+----- ---- -------
+1	1	0.5132
+1	2	0.5146
+1	4	0.5147
+1	5	0.5147
+
+With stemming
+1	3	0.5178
+1	4	0.5179
