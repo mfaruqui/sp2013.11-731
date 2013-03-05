@@ -18,4 +18,4 @@ Classifier: LDA: Linear Discriminant Analysis
 
 Running the code:-
 
-python main.py data/lc_tok_train_h1-h2-ref data/train.gold clusters/clus_400 data/lc_tok_test_h1-h2-ref | ./grade
+python src/main.py data/lc_tok_train_h1-h2-ref data/train.gold clusters/clus_400 data/lc_tok_test_h1-h2-ref | ./grade
