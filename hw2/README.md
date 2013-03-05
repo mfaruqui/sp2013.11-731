@@ -1,19 +1,21 @@
-There are three Python programs here (`-h` for usage):
+Translation Evluation
+---------------------
 
- - `./evaluate` evaluates pairs of MT output hypotheses relative to a reference translation using counts of matched words
- - `./check` checks that the output file is correctly formatted
- - `./grade` computes the accuracy
+Manaal Faruqui, mfaruqui@cs.cmu.edu
 
-The commands are designed to work in a pipeline. For instance, this is a valid invocation:
+Pre-processing:-
+- Lower-casing the data, tokenization
 
-    ./evaluate | ./check | ./grade
+My translation evaluation takes the following features:-
 
+(1) 1-gram, 2-gram, 3-gram, 4-gram precision
 
-The `data/` directory contains a training set and a test set
+(2) 1-gram, 2-gram, 3-gram, 4-gram precision of Brown word clusters
 
- - `data/train.hyp1-hyp2-ref` is a file containing tuples of two translation hypotheses and a human (gold standard) translation.
+(3) 1-gram recall
 
- - `data/train.gold` contains gold standard human judgements indicating whether the first hypothesis (hyp1) or the second hypothesis (hyp2) is better or equally good/bad.
+Classifier: LDA: Linear Discriminant Analysis
 
- - `data/test.hyp1-hyp2-ref` is a blind test set containing tuples of two translation hypotheses and a human (gold standard) translation. You will be graded on how well your predictions correlate with human judgements.
+Running the code:-
 
+python main.py data/lc_tok_train_h1-h2-ref data/train.gold clusters/clus_400 data/lc_tok_test_h1-h2-ref | ./grade
