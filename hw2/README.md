@@ -1,4 +1,4 @@
-Translation Evluation
+Translation Evaluation
 ---------------------
 
 Manaal Faruqui, mfaruqui@cs.cmu.edu
