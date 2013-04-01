@@ -13,8 +13,14 @@ def get_free_spans2(bit_array):
     spans = []
     for to_index in range(first_uncovered, len(bit_array)):
         spans.append(range(first_uncovered, to_index+1))
-    
     return spans
+
+def is_bit_array_valid(covered, current_src_pos, distortion_threshold):
+    for i in range (0,len(covered)):
+        if not covered[i] and (i == 0 or covered[i-1]):
+            if abs(current_src_pos - i) > distortion_threshold:
+                return False
+    return True
 
 def get_free_spans(bit_array):
     

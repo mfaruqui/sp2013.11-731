@@ -51,7 +51,6 @@ for f in input_sents:
     # find best translation by looking at the best scoring hypothesis
     # on the last stack
     winner = max(stacks[-1].itervalues(), key=lambda h: h.logprob)
-    print winner.logprob
     def extract_english_recursive(h):
         return '' if h.predecessor is None else '%s%s ' % (extract_english_recursive(h.predecessor), h.phrase.english)
     print extract_english_recursive(winner)
