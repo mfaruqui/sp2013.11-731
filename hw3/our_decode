@@ -24,16 +24,20 @@ EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRAN
 DISTORTION_PENALTY = 1.5
 DISTORTION_THRESHOLD = 4
 # prune the phrase table
-MAX_PHRASE_OPTIONS = 10
+MAX_PHRASE_OPTIONS = 20
 # brevity penalty
 BREVITY_PENALTY = 0.0
 # modifications for the best complete hypothesis in the stack decoder
 USE_SWAPS = True
-USE_SPLITS = False
-USE_MERGES = False
-USE_RETRANSLATES = False
+USE_SPLITS = True
+USE_MERGES = True
+MOST_GREEDY = True
 # future cost
 USE_FUTURE_COST = True
+
+# TODO:
+SPARSE_TM_SCORE_PENALTY = 0.0 # p(f|e) = 1 is, usually, not a good sign
+USE_RETRANSLATES = False
 
 hypothesis = namedtuple('hypothesis', 'logprob, heuristic_logprob, lm_state, bit_array, to_index, future_logprob, predecessor, phrase')
 
@@ -114,6 +118,7 @@ def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_bette
                 continue
             # for each translation option of the first subphrase
             for new_translation_option1 in tm[new_src_phrase1]:
+                new_phrase_words1 = new_translation_option1[0].split()
                 # for each translation option of the second subphrase
                 for new_translation_option2 in tm[new_src_phrase2]:
                     # populate the new hypothesis
@@ -123,21 +128,31 @@ def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_bette
                     # adjust tm logprob
                     new_logprob = original_logprob - original_phrase_pairs[i][1][1] + new_phrase_pairs[i][1][1] + new_phrase_pairs[i+1][1][1]
                     # adjust lm logprob
-                    lm_state = lm.begin() if i-1 == 0 else tuple(tgt_words[max(0,tgt_from_to[i-1][0]-2):tgt_from_to[i-1][0]])
+                    lm_state = lm.begin() if i == 0 else tuple(tgt_words[max(0,tgt_from_to[i][0]-2):tgt_from_to[i][0]])
                     current_phrase_words = tgt_words[ tgt_from_to[i][0]:tgt_from_to[i][1] ]
                     next_phrase_words = tgt_words[ tgt_from_to[i][1]:tgt_from_to[i][1]+2 ]
                     if len(next_phrase_words) == 0: 
                         next_phrase_words = [lm.end_string()]
-                    new_phrase_words1 = new_translation_option1[0].split()
                     new_phrase_words2 = new_translation_option2[0].split()
                     old_words_to_score = current_phrase_words + next_phrase_words
                     new_words_to_score = new_phrase_words1 + new_phrase_words2 + next_phrase_words
-                    new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score)[1] + lm.score_sequence(lm_state, new_words_to_score)[1]
+                    old_score = lm.score_sequence(lm_state, old_words_to_score)[1]
+                    new_score = lm.score_sequence(lm_state, new_words_to_score)[1]
+                    new_logprob = new_logprob - old_score + new_score
 
                     # only return better hypotheses
                     split = (new_logprob, new_phrase_pairs)
+                    #sys.stderr.write('<<<<<<<<<<< original <<<<<<<<<\n')
+                    #sys.stderr.write('{0}\n'.format( (original_logprob, original_phrase_pairs) ) )
                     if not only_return_better_hypotheses or (only_return_better_hypotheses and new_logprob > original_logprob):
+#                        sys.stderr.write('>>>>>>>>>>> candidate split >>>>>>>>>>>>\n')
+#                        sys.stderr.write('{0}\n\n'.format(split))
+#                        sys.stderr.write('new_logprob = new_logprob - old_score + new_score = new_logprob - {0} + {1} \n'.format(old_score, new_score))
+#                        sys.stderr.write('lm_state = {0}, old_words_to_score = {1}, new_words_to_score = {2}'.format(lm_state, old_words_to_score, new_words_to_score))
+#                        sys.stderr.write('\n\n')
                         splits.append(split)
+                        if MOST_GREEDY:
+                            return splits
 
     if len(splits) > 0:
         sys.stderr.write('{0} splits are better than original\n'.format(len(splits)))
@@ -190,12 +205,25 @@ def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_bette
             new_phrase_words = new_translation_option[0].split()
             old_words_to_score = prev_phrase_words + current_phrase_words + next_phrase_words
             new_words_to_score = new_phrase_words + next_phrase_words
-            new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score)[1] + lm.score_sequence(lm_state, new_words_to_score)[1]
+            temp_state = tuple(lm_state)
+            old_score = lm.score_sequence(lm_state, old_words_to_score)[1]
+            assert(temp_state == lm_state)
+            new_score = lm.score_sequence(lm_state, new_words_to_score)[1]
+            new_logprob = new_logprob - old_score + new_score
 
             # only return better hypotheses
             merge = (new_logprob, new_phrase_pairs)
+            #sys.stderr.write('<<<<<<<<<<< original <<<<<<<<<\n')
+            #sys.stderr.write('{0}\n'.format( (original_logprob, original_phrase_pairs) ) )
             if not only_return_better_hypotheses or (only_return_better_hypotheses and new_logprob > original_logprob):
+                #sys.stderr.write('>>>>>>>>>>> candidate merge >>>>>>>>>>>>\n')
+                #sys.stderr.write('{0}\n\n'.format(merge))
+                #sys.stderr.write('new_logprob = new_logprob - old_score + new_score = new_logprob - {0} + {1} \n'.format(old_score, new_score))
+                #sys.stderr.write('lm_state = {0}, old_words_to_score = {1}, new_words_to_score = {2}'.format(lm_state, old_words_to_score, new_words_to_score))
+                #sys.stderr.write('\n\n')
                 merges.append(merge)
+                if MOST_GREEDY:
+                    return merges
 
     if len(merges) > 0:
         sys.stderr.write('{0} merges are better than original\n'.format(len(merges)))
@@ -250,6 +278,8 @@ def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hy
         new_swap = (new_logprob, new_phrase_pairs)
         if not only_return_better_hypotheses or (only_return_better_hypotheses and new_logprob > original_logprob):
             swaps.append(new_swap)
+            if MOST_GREEDY:
+                return swaps
     
     if len(swaps) > 0:
         sys.stderr.write('{0} swaps are better than original\n'.format(len(swaps)))
@@ -485,6 +515,7 @@ for f in input_sents:
     prev_logprob = winner.logprob - 1
     sys.stderr.write('===========================\n try to improve the best hypothesis by editing it\n\n')
     while winner_tuple[0] > prev_logprob:
+        sys.stderr.write('winner = {0}\n\n'.format(winner_tuple))
 	prev_logprob = winner_tuple[0]
         sys.stderr.write('logprob = {0}\n'.format(prev_logprob))
 	winner_tuple = edit_complete_hypothesis(f, winner_tuple)
