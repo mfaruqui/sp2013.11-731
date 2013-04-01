@@ -58,11 +58,12 @@ class LM:
         return ((), score + self.table[("<unk>",)].logprob)
         
     def score_sequence(self, state, word_list):
+        assert(len(word_list) > 0)
         total_score = 0.0
         for word in word_list:
             (state, word_score) = self.score(state, word)
             total_score += word_score
-        return total_score
+        return (state, total_score)
 
     def end(self, state):
         return self.score(state, "</s>")[1]

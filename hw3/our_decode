@@ -17,12 +17,23 @@ parser.add_argument('-l', '--language-model', dest='lm', default='data/lm', help
 parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', default=False,  help='Verbose mode (default=off)')
 opts = parser.parse_args()
 
-DISTORTION_PENALTY = 1.5
+# penalize the use of an empty translation, but still allow it in case of OOVs
 LOGPROB_OF_EMPTY_TRANSLATION = -20.0
 EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRANSLATION)
+# distortion
+DISTORTION_PENALTY = 1.5
 DISTORTION_THRESHOLD = 4
+# prune the phrase table
 MAX_PHRASE_OPTIONS = 10
+# brevity penalty
 BREVITY_PENALTY = 0.0
+# modifications for the best complete hypothesis in the stack decoder
+USE_SWAPS = True
+USE_SPLITS = False
+USE_MERGES = False
+USE_RETRANSLATES = False
+# future cost
+USE_FUTURE_COST = True
 
 hypothesis = namedtuple('hypothesis', 'logprob, heuristic_logprob, lm_state, bit_array, to_index, future_logprob, predecessor, phrase')
 
@@ -60,6 +71,11 @@ def get_phrase_pairs(h, phrase_pairs):
         src_phrase = extract_src_phrase(h)
         phrase_pairs.insert(0, (src_phrase, h.phrase) )
         get_phrase_pairs(h.predecessor, phrase_pairs)
+
+# find all ways to retranslate one of the src phrase
+def get_all_retranslations(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+    assert(False)
+    return []
 
 # find all ways to split a phrase pair into two
 def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
@@ -116,7 +132,7 @@ def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_bette
                     new_phrase_words2 = new_translation_option2[0].split()
                     old_words_to_score = current_phrase_words + next_phrase_words
                     new_words_to_score = new_phrase_words1 + new_phrase_words2 + next_phrase_words
-                    new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score) + lm.score_sequence(lm_state, new_words_to_score)
+                    new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score)[1] + lm.score_sequence(lm_state, new_words_to_score)[1]
 
                     # only return better hypotheses
                     split = (new_logprob, new_phrase_pairs)
@@ -174,7 +190,7 @@ def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_bette
             new_phrase_words = new_translation_option[0].split()
             old_words_to_score = prev_phrase_words + current_phrase_words + next_phrase_words
             new_words_to_score = new_phrase_words + next_phrase_words
-            new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score) + lm.score_sequence(lm_state, new_words_to_score)
+            new_logprob = new_logprob - lm.score_sequence(lm_state, old_words_to_score)[1] + lm.score_sequence(lm_state, new_words_to_score)[1]
 
             # only return better hypotheses
             merge = (new_logprob, new_phrase_pairs)
@@ -228,7 +244,7 @@ def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hy
         old_words_to_score = prev_phrase_words + current_phrase_words + next_phrase_words
 
         # then we update the totla logprob according to the lm score
-        new_logprob = original_logprob - lm.score_sequence(lm_state, old_words_to_score) + lm.score_sequence(lm_state, new_words_to_score)
+        new_logprob = original_logprob - lm.score_sequence(lm_state, old_words_to_score)[1] + lm.score_sequence(lm_state, new_words_to_score)[1]
 
         # add this new hypothesis (only if it's better)
         new_swap = (new_logprob, new_phrase_pairs)
@@ -248,15 +264,20 @@ def edit_complete_hypothesis(f, winner_tuple):
     edits = [winner_tuple]
 
     # add all possible swaps
-    edits += get_all_swaps(original_phrase_pairs, original_logprob)
+    if USE_SWAPS:
+        edits += get_all_swaps(original_phrase_pairs, original_logprob)
 
     # add all possible merges
-#    edits += get_all_merges(f, original_phrase_pairs, original_logprob)
+    if USE_MERGES:
+        edits += get_all_merges(f, original_phrase_pairs, original_logprob)
 
     # add all possible splits
-#    edits += get_all_splits(f, original_phrase_pairs, original_logprob)
+    if USE_SPLITS:
+        edits += get_all_splits(f, original_phrase_pairs, original_logprob)
 
     # add all possible translation change
+    if USE_RETRANSLATES:
+        edits += get_all_retranslations(f, original_phrase_pairs, original_logprob)
 
     # find the best edit
     best_edit = max(edits)
@@ -375,6 +396,10 @@ for f in input_sents:
                 if f[fromIndex:toIndex] not in tm:
                     continue
 
+                # prune long distance reorderings
+                if abs(fromIndex-h.to_index) > DISTORTION_THRESHOLD:
+                    continue
+
                 # create the new bit vector for this source span
                 new_bit_array = list(h.bit_array)
                 for covered_src_word_index in range(fromIndex, toIndex): 
@@ -386,13 +411,13 @@ for f in input_sents:
                     continue
                 
                 # determine the future cost for this new bit vector
-                future_logprob = compute_future_logprob(new_bit_array, span_future_logprob)
+                if USE_FUTURE_COST:
+                    future_logprob = compute_future_logprob(new_bit_array, span_future_logprob)
+                else:
+                    future_logprob = 0.0
 
                 # for each possible phrase translation
                 for phrase in tm[f[fromIndex:toIndex]]:
-                    # prune long distance reorderings
-                    if abs(fromIndex-h.to_index) > DISTORTION_THRESHOLD:
-                        continue
                     # adjust future_logprob
                     heuristic_logprob = h.heuristic_logprob - h.future_logprob + future_logprob
                     logprob = h.logprob
@@ -402,14 +427,12 @@ for f in input_sents:
                     # lm prob
                     lm_state = h.lm_state
                     english_splits = phrase.english.split()
-                    for word in english_splits:
-                        (lm_state, word_logprob) = lm.score(lm_state, word)
-                        logprob += word_logprob
-                        heuristic_logprob += word_logprob
-                    logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
-                    heuristic_logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
+                    (lm_state, local_lm_score) = lm.score_sequence(lm_state, english_splits)
+                    local_lm_score += lm.end(lm_state) if toIndex == len(f) else 0.0
+                    logprob += local_lm_score
+                    heuristic_logprob += local_lm_score
                     # reordering prob
-                    distortion_logprob = -1.0 * DISTORTION_PENALTY ** abs(fromIndex - h.to_index)
+                    distortion_logprob = -1.0 * DISTORTION_PENALTY * abs(fromIndex - h.to_index)
                     heuristic_logprob += distortion_logprob
                     # brevity penalty
                     heuristic_logprob += BREVITY_PENALTY * len(english_splits)
@@ -418,10 +441,12 @@ for f in input_sents:
                     j = i + toIndex - fromIndex
                     if j >= len(stacks):
                         print 'fatal: whats wrong? i={4}, j={0}, len(stacks)={1}, fromIndex={2}, toIndex={3}'.format(j, len(stacks), fromIndex, toIndex, i)
-                        sys.exit(1)
-                    if (lm_state, new_bit_array) not in stacks[j] or \
-                            stacks[j][ (lm_state, new_bit_array) ].logprob < logprob: # second case is recombination
-                        stacks[j][ (lm_state, new_bit_array) ] = new_hypothesis 
+                        assert(False)
+                    if (lm_state, new_bit_array) not in stacks[j]:
+                        stacks[j][ (lm_state, new_bit_array) ] = new_hypothesis
+                    # recombination
+                    elif stacks[j][ (lm_state, new_bit_array) ].logprob < logprob: # new is better
+                        stacks[j][ (lm_state, new_bit_array) ] = new_hypothesis
 
     # the last stack is empty! oh no! 
     if len(stacks[-1]) == 0:
