@@ -6,11 +6,12 @@ from models import *
 import heapq
 from collections import namedtuple, defaultdict
 from span import *
+from marginalize import marginalize
 
 parser = argparse.ArgumentParser(description='Simple phrase based decoder.')
 parser.add_argument('-i', '--input', dest='input', default='data/input', help='File containing sentences to translate (default=data/input)')
 parser.add_argument('-t', '--translation-model', dest='tm', default='data/tm', help='File containing translation model (default=data/tm)')
-parser.add_argument('-s', '--stack-size', dest='s', default=30, type=int, help='Maximum stack size (default=1)')
+parser.add_argument('-s', '--stack-size', dest='s', default=50, type=int, help='Maximum stack size (default=1)')
 parser.add_argument('-n', '--num_sentences', dest='num_sents', default=sys.maxint, type=int, help='Number of sentences to decode (default=no limit)')
 parser.add_argument('-l', '--language-model', dest='lm', default='data/lm', help='File containing ARPA-format language model (default=data/lm)')
 parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', default=False,  help='Verbose mode (default=off)')
@@ -21,6 +22,7 @@ LOGPROB_OF_EMPTY_TRANSLATION = -20.0
 EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRANSLATION)
 DISTORTION_THRESHOLD = 4
 MAX_PHRASE_OPTIONS = 10
+BREVITY_PENALTY = 0.0
 
 tm = models.TM(opts.tm, MAX_PHRASE_OPTIONS)
 lm = models.LM(opts.lm)
@@ -162,7 +164,8 @@ for f in input_sents:
                     heuristic_logprob += phrase.logprob
                     # lm prob
                     lm_state = h.lm_state
-                    for word in phrase.english.split():
+                    english_splits = phrase.english.split()
+                    for word in english_splits:
                         (lm_state, word_logprob) = lm.score(lm_state, word)
                         logprob += word_logprob
                         heuristic_logprob += word_logprob
@@ -171,6 +174,9 @@ for f in input_sents:
                     # reordering prob
                     distortion_logprob = -1.0 * DISTORTION_PENALTY ** abs(fromIndex - h.to_index)
                     heuristic_logprob += distortion_logprob
+                    # brevity penalty
+                    heuristic_logprob += BREVITY_PENALTY * len(english_splits)
+                    # create the new hypothesis
                     new_hypothesis = hypothesis(logprob, heuristic_logprob, lm_state, new_bit_array, toIndex, future_logprob, h, phrase)
                     j = i + toIndex - fromIndex
                     if j >= len(stacks):
@@ -186,25 +192,49 @@ for f in input_sents:
             print "{0}:{1}".format(stack_index, len(stacks[stack_index]))
         sys.exit()
 
+    def extract_english_recursive(h):
+        return '' if h.predecessor is None else '%s%s ' % (extract_english_recursive(h.predecessor), h.phrase.english)
+
+    '''
+    # for each complete hypothesis in the final stack, compute the actual model score by marginalizing the alignments
+    final_stack = []
+    for complete_hypothesis in stacks[-1].itervalues():
+	complete_translation = extract_english_recursive(complete_hypothesis)
+	final_logprob = marginalize(f, complete_translation, lm, tm)
+	final_stack.append((final_logprob, complete_translation))
+        sys.stderr.write('original_score = {0:.2f}, marginalized_score = {1:.2f}\n'.format(complete_hypothesis.logprob, final_logprob))
+
+    (best_logprob, translation) = max(final_stack)
+    sys.stderr.write('best_marginalized: {0}\n'.format(translation))
+    '''
+
     # find best translation by looking at the best scoring hypothesis
     # on the last stack
     winner = max(stacks[-1].itervalues(), key=lambda h: h.logprob)
-    def extract_english_recursive(h):
-        return '' if h.predecessor is None else '%s%s ' % (extract_english_recursive(h.predecessor), h.phrase.english)
+    old_translation = extract_english_recursive(winner)
+    sys.stderr.write('best_originalized: {0}\n\n'.format(old_translation))
+   
+    prev_logprob = winner.logprob - 1
+    while winner.logprob > prev_logprob:
+	prev_logprob = winner.logprob
+	edits = modify_complete_hypothesis(winner)
+	winner = max(edits, key=lambda h: h.logprob)
+
     translation = extract_english_recursive(winner)
+    best_logprob = winner.logprob 
 
     # if you use an empty phrase
     if translation.find('MANAAL_WALEED') != -1:
-        sys.stderr.write('decoder1: {0} <<{1:.2f}>>, heuristic score {2}\n'.format(translation, winner.logprob, winner.heuristic_logprob))
+        sys.stderr.write('decoder1: {0} <<{1:.2f}>> final_stack_size={2}\n'.format(translation, best_logprob, len(stacks[-1])))
         winner = baseline_decode(f)
         translation = extract_english_recursive(winner)
         sys.stderr.write('decoder2: {0} <<{1:.2f}>>\n=========\n'.format(translation, winner.logprob))
     else:
-        sys.stderr.write('decoder1: {0} <<{1:.2f}>>, heuristic score {2}\n'.format(translation, winner.logprob, winner.heuristic_logprob))
+        sys.stderr.write('decoder1: {0} <<{1:.2f}>> final_stack_size={2}\n'.format(translation, best_logprob, len(stacks[-1])))
         baselineWinner = baseline_decode(f)
         baselineTranslation = extract_english_recursive(baselineWinner)
         sys.stderr.write('decoder0: {0} <<{1:.2f}>>\n=========\n'.format(baselineTranslation, baselineWinner.logprob))
-
+    
     # print the translation
     print translation
 
