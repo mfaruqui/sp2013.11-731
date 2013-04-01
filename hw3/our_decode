@@ -4,7 +4,7 @@ import sys
 import models
 from models import *
 import heapq
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from span import *
 
 parser = argparse.ArgumentParser(description='Simple phrase based decoder.')
@@ -26,6 +26,52 @@ tm = models.TM(opts.tm, MAX_PHRASE_OPTIONS)
 lm = models.LM(opts.lm)
 sys.stderr.write('Decoding %s...\n' % (opts.input,))
 input_sents = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+
+def precompute_span_future_logprob(f):
+    span_future_logprob = defaultdict(lambda:defaultdict(float))
+    # example: f == ('a', 'b', 'c'); len(f) == 3; span_size in [1, 2, 3]
+    for span_size in range(1, len(f)+1):
+        # example: span_size == 2; i in [0, 1]
+        for i in range(0, len(f) - (span_size-1)):
+            # example: i == 1; j in [2, 3]
+            for j in range(i+1, len(f)+1):
+                # initialize the logprob of this span to -1000000000000000000
+                span_future_logprob[i][j] = -10000000000000
+                # for each possible decomposition of the range(i, j)
+                # example: i == 0; j == 3; k in [1, 2]
+                for k in range(i+1, j):
+                    # if it turns out translating individual components in this range has a better logprob, use that decomposition
+                    if span_future_logprob[i][k] + span_future_logprob[k][j] > span_future_logprob[i][j]:
+                        span_future_logprob[i][j] = span_future_logprob[i][k] + span_future_logprob[k][j]
+                # for each possible translation of f[i:j]
+                if f[i:j] not in tm:
+                    continue
+                for phrase in tm[f[i:j]]:
+                    local_lm_logprob = 0
+                    lm_state = ()
+                    for word in phrase.english.split():
+                        (lm_state, word_logprob) = lm.score(lm_state, word)
+                        local_lm_logprob += word_logprob
+                    phraseCost = local_lm_logprob + phrase.logprob
+                    if phraseCost > span_future_logprob[i][j]:
+                        span_future_logprob[i][j] = phraseCost
+    return span_future_logprob
+
+def compute_future_logprob(coverage_vector, span_future_logprob):
+    future_logprob = 0
+    insideUncoveredSpan = False
+    uncoveredSpanStartsAt = -1
+    for i in range(0, len(coverage_vector)):
+        if coverage_vector[i] and insideUncoveredSpan:
+            future_logprob += span_future_logprob[uncoveredSpanStartsAt][i]
+            insideUncoveredSpan = False
+            uncoveredSpanStartsAt = -1
+        elif not coverage_vector[i] and not insideUncoveredSpan:
+            insideUncoveredSpan = True
+            uncoveredSpanStartsAt = i
+        if insideUncoveredSpan and i == len(coverage_vector) - 1:
+            future_logprob += span_future_logprob[uncoveredSpanStartsAt][len(coverage_vector)]
+    return future_logprob
 
 def baseline_decode(f):
     hypothesis = namedtuple('hypothesis', 'logprob, lm_state, predecessor, phrase')
@@ -56,7 +102,7 @@ def baseline_decode(f):
         return '' if h.predecessor is None else '%s%s ' % (extract_english_recursive(h.predecessor), h.phrase.english)
     return winner
                     
-hypothesis = namedtuple('hypothesis', 'logprob, heuristic_logprob, lm_state, bit_array, to_index, predecessor, phrase')
+hypothesis = namedtuple('hypothesis', 'logprob, heuristic_logprob, lm_state, bit_array, to_index, future_logprob, predecessor, phrase')
 for f in input_sents:
     # The following code implements a DP monotone decoding
     # algorithm (one that doesn't permute the target phrases).
@@ -66,50 +112,72 @@ for f in input_sents:
     # of any i words (remember to keep track of which words those
     # are, and to estimate future costs)
     bit_array = [False for _ in f]
-    initial_hypothesis = hypothesis(0.0, 0.0, lm.begin(), bit_array, 0, None, None)
+    initial_hypothesis = hypothesis(0.0, 0.0, lm.begin(), bit_array, 0, 0, None, None)
+
+    # precompute future costs of all possible uncovered spans
+    span_future_logprob = precompute_span_future_logprob(f)
 
     stacks = [{} for _ in f] + [{}]
     stacks[0][lm.begin()] = initial_hypothesis
     for i, stack in enumerate(stacks[:-1]):
         # extend the top s hypotheses in the current stack
         for h in heapq.nlargest(opts.s, stack.itervalues(), key=lambda h: h.heuristic_logprob): # prune
+            
+            # src spans that we may want to cover
             free_spans = get_free_spans(h.bit_array)
             for span in free_spans:
                 fromIndex = span[0]
                 toIndex = span[-1]+1
+                
+                # add an empty translation if necessary
                 if toIndex - fromIndex == 1 and f[fromIndex:toIndex] not in tm:
                     tm[ tuple(f[fromIndex:toIndex]) ] = [EMPTY_TGT_PHRASE]
-                if f[fromIndex:toIndex] in tm:
-                    new_bit_array = list(h.bit_array)
-                    for covered_src_word_index in range(fromIndex, toIndex): 
-                        new_bit_array[covered_src_word_index] = True
-                    if not is_bit_array_valid(new_bit_array, toIndex, DISTORTION_THRESHOLD):
+                
+                # skip spans which don't have a translation
+                if f[fromIndex:toIndex] not in tm:
+                    continue
+
+                # create the new bit vector for this source span
+                new_bit_array = list(h.bit_array)
+                for covered_src_word_index in range(fromIndex, toIndex): 
+                    new_bit_array[covered_src_word_index] = True
+                
+                # can we translate all the uncovered src words in this new bit vector?
+                if not is_bit_array_valid(new_bit_array, toIndex, DISTORTION_THRESHOLD):
+                    continue
+                
+                # determine the future cost for this new bit vector
+                future_logprob = compute_future_logprob(new_bit_array, span_future_logprob)
+
+                # for each possible phrase translation
+                for phrase in tm[f[fromIndex:toIndex]]:
+                    # prune long distance reorderings
+                    if abs(fromIndex-h.to_index) > DISTORTION_THRESHOLD:
                         continue
-                    for phrase in tm[f[fromIndex:toIndex]]:
-                        # prune long distance reorderings
-                        if abs(fromIndex-h.to_index) > DISTORTION_THRESHOLD:
-                            continue
-                        # tm prob
-                        logprob = h.logprob + phrase.logprob
-                        heuristic_logprob = h.heuristic_logprob + phrase.logprob
-                        # lm prob
-                        lm_state = h.lm_state
-                        for word in phrase.english.split():
-                            (lm_state, word_logprob) = lm.score(lm_state, word)
-                            logprob += word_logprob
-                            heuristic_logprob += word_logprob
-                        logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
-                        heuristic_logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
-                        # reordering prob
-                        distortion_logprob = -1.0 * DISTORTION_PENALTY ** abs(fromIndex - h.to_index)
-                        heuristic_logprob += distortion_logprob
-                        new_hypothesis = hypothesis(logprob, heuristic_logprob, lm_state, new_bit_array, toIndex, h, phrase)
-                        j = i + toIndex - fromIndex
-                        if j >= len(stacks):
-                            print 'fatal: whats wrong? i={4}, j={0}, len(stacks)={1}, fromIndex={2}, toIndex={3}'.format(j, len(stacks), fromIndex, toIndex, i)
-                            sys.exit(1)
-                        if lm_state not in stacks[j] or stacks[j][lm_state].logprob < logprob: # second case is recombination
-                            stacks[j][lm_state] = new_hypothesis 
+                    # adjust future_logprob
+                    heuristic_logprob = h.heuristic_logprob - h.future_logprob + future_logprob
+                    logprob = h.logprob
+                    # tm prob
+                    logprob += phrase.logprob
+                    heuristic_logprob += phrase.logprob
+                    # lm prob
+                    lm_state = h.lm_state
+                    for word in phrase.english.split():
+                        (lm_state, word_logprob) = lm.score(lm_state, word)
+                        logprob += word_logprob
+                        heuristic_logprob += word_logprob
+                    logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
+                    heuristic_logprob += lm.end(lm_state) if toIndex == len(f) else 0.0
+                    # reordering prob
+                    distortion_logprob = -1.0 * DISTORTION_PENALTY ** abs(fromIndex - h.to_index)
+                    heuristic_logprob += distortion_logprob
+                    new_hypothesis = hypothesis(logprob, heuristic_logprob, lm_state, new_bit_array, toIndex, future_logprob, h, phrase)
+                    j = i + toIndex - fromIndex
+                    if j >= len(stacks):
+                        print 'fatal: whats wrong? i={4}, j={0}, len(stacks)={1}, fromIndex={2}, toIndex={3}'.format(j, len(stacks), fromIndex, toIndex, i)
+                        sys.exit(1)
+                    if lm_state not in stacks[j] or stacks[j][lm_state].logprob < logprob: # second case is recombination
+                        stacks[j][lm_state] = new_hypothesis 
 
     # the last stack is empty! oh no! 
     if len(stacks[-1]) == 0:
