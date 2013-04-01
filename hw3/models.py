@@ -53,9 +53,19 @@ class LM:
             if ngram in self.table:
                 return (ngram[-2:], score + self.table[ngram].logprob)
             else: #backoff
-                score += self.table[ngram[:-1]].backoff if len(ngram) > 1 else 0.0 
+                score += self.table[ngram[:-1]].backoff if len(ngram) > 1 and ngram[:-1] in self.table else 0.0 
                 ngram = ngram[1:]
         return ((), score + self.table[("<unk>",)].logprob)
         
+    def score_sequence(self, state, word_list):
+        total_score = 0.0
+        for word in word_list:
+            (state, word_score) = self.score(state, word)
+            total_score += word_score
+        return total_score
+
     def end(self, state):
         return self.score(state, "</s>")[1]
+
+    def end_string(self):
+        return ("</s>",)
