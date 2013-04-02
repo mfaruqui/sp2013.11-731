@@ -22,22 +22,22 @@ LOGPROB_OF_EMPTY_TRANSLATION = -20.0
 EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRANSLATION)
 # distortion
 DISTORTION_PENALTY = 1.5
-DISTORTION_THRESHOLD = 4
+DISTORTION_THRESHOLD = 5
 # prune the phrase table
 MAX_PHRASE_OPTIONS = 20
 # brevity penalty
 BREVITY_PENALTY = 0.0
 # modifications for the best complete hypothesis in the stack decoder
-USE_SWAPS = True
+USE_SWAPS = False
 USE_SPLITS = True
 USE_MERGES = True
-MOST_GREEDY = True
+USE_RETRANSLATES = True
+MOST_GREEDY = False
 # future cost
-USE_FUTURE_COST = True
+FUTURE_COST = 1.0
 
 # TODO:
 SPARSE_TM_SCORE_PENALTY = 0.0 # p(f|e) = 1 is, usually, not a good sign
-USE_RETRANSLATES = False
 
 hypothesis = namedtuple('hypothesis', 'logprob, heuristic_logprob, lm_state, bit_array, to_index, future_logprob, predecessor, phrase')
 
@@ -78,9 +78,77 @@ def get_phrase_pairs(h, phrase_pairs):
 
 # find all ways to retranslate one of the src phrase
 def get_all_retranslations(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
-    assert(False)
-    return []
+    # populate the two lists:
+    # tgt_from_to = [ (tgt_pos_from, tgt_pos_to), (tgt_pos_from, tgt_pos_to), ... ]
+    # tgt_words = [ e1, e2, e3, ... ]
+    tgt_from_to = []
+    tgt_words = []
+    current_tgt_pos = 0
+    for i, phrase_pair in enumerate(original_phrase_pairs):
+        tgt_string = phrase_pair[1][0]
+        splits = tgt_string.split()
+        tgt_words += splits
+	tgt_from_to.append( (current_tgt_pos, current_tgt_pos + len(splits)) )
+        current_tgt_pos += len(splits)
+    assert(len(tgt_from_to) == len(original_phrase_pairs))
 
+    retranslations = []
+
+    # for each src phrase in original_phrase_pairs
+    # TODO: we don't allow the last phrase to be translated because we think there is a period there and we want to keep it :D #SILLY
+    for i in range(0, len(original_phrase_pairs)-1):
+        # identify the src phrase that will be retranslated
+        src_phrase = f[original_phrase_pairs[i][0][0]:original_phrase_pairs[i][0][1]]
+        # skip src phrases which don't exist in the tm
+        if src_phrase not in tm:
+            continue
+        # for each possible translation of this src phrase
+        for new_translation_option in tm[src_phrase]:
+            # skip the translation option that's identical to the current translation (in original_phrase_pairs)
+            if new_translation_option == original_phrase_pairs[i][1]:
+                continue
+            # populate the new hypothesis
+            new_phrase_pairs = list(original_phrase_pairs)
+            new_phrase_pairs[i] = (original_phrase_pairs[i][0], new_translation_option)
+            # adjust tm score
+            new_logprob = original_logprob - original_phrase_pairs[i][1][1] + new_translation_option[1]
+            # adjust lm score
+            lm_state = lm.begin() if i == 0 else tuple(tgt_words[max(0,tgt_from_to[i][0]-2):tgt_from_to[i][0]])
+            current_phrase_words = tgt_words[ tgt_from_to[i][0]:tgt_from_to[i][1] ]
+            next_phrase_words = tgt_words[ tgt_from_to[i][1]:tgt_from_to[i][1]+2 ]
+            if len(next_phrase_words) < 2: 
+                next_phrase_words += [lm.end_string()]
+            new_phrase_words = new_translation_option[0].split()
+            old_words_to_score = current_phrase_words + next_phrase_words
+            new_words_to_score = new_phrase_words + next_phrase_words
+            old_score = lm.score_sequence(lm_state, old_words_to_score)[1]
+            new_score = lm.score_sequence(lm_state, new_words_to_score)[1]
+            new_logprob = new_logprob - old_score + new_score
+            
+            # create the retranslated complete hypothesis
+            retranslation = (new_logprob, new_phrase_pairs)
+            #sys.stderr.write('<<<<<<<<<<< original <<<<<<<<<\n')
+            #sys.stderr.write('{0}\n'.format( (original_logprob, original_phrase_pairs) ) )
+            if not only_return_better_hypotheses or (only_return_better_hypotheses and new_logprob > original_logprob):
+                #sys.stderr.write('>>>>>>>>>>> candidate re-translation >>>>>>>>>>>>\n')
+                #sys.stderr.write('{0}\n\n'.format(retranslation))
+                #sys.stderr.write('src_phrase={0}\n'.format(src_phrase))
+                #sys.stderr.write('new_translation_option={0}\n'.format(new_translation_option))
+                #sys.stderr.write('lm_state={0}\n'.format(lm_state))
+                #sys.stderr.write('old_words_to_score={0}\n'.format(old_words_to_score))
+                #sys.stderr.write('new_words_to_score={0}\n'.format(new_words_to_score))
+                #sys.stderr.write('new_logprob = new_logprob - old_score + new_score = new_logprob - {0} + {1} \n'.format(old_score, new_score))
+
+                #sys.stderr.write('\n\n')
+                retranslations.append(retranslation)
+                if MOST_GREEDY:
+                    return retranslations
+
+    if len(retranslations) > 0:
+        sys.stderr.write('{0} re-translations are better than original\n'.format(len(retranslations)))
+    return retranslations
+
+        
 # find all ways to split a phrase pair into two
 def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
     # populate the two lists:
@@ -131,7 +199,7 @@ def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_bette
                     lm_state = lm.begin() if i == 0 else tuple(tgt_words[max(0,tgt_from_to[i][0]-2):tgt_from_to[i][0]])
                     current_phrase_words = tgt_words[ tgt_from_to[i][0]:tgt_from_to[i][1] ]
                     next_phrase_words = tgt_words[ tgt_from_to[i][1]:tgt_from_to[i][1]+2 ]
-                    if len(next_phrase_words) == 0: 
+                    if len(next_phrase_words) < 2: 
                         next_phrase_words = [lm.end_string()]
                     new_phrase_words2 = new_translation_option2[0].split()
                     old_words_to_score = current_phrase_words + next_phrase_words
@@ -200,7 +268,7 @@ def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_bette
             current_phrase_words = tgt_words[ tgt_from_to[i][0]:tgt_from_to[i][1] ]
             prev_phrase_words = tgt_words[ tgt_from_to[i-1][0]:tgt_from_to[i-1][1] ]
             next_phrase_words = tgt_words[ tgt_from_to[i][1]:tgt_from_to[i][1]+2 ]
-            if len(next_phrase_words) == 0: 
+            if len(next_phrase_words) < 2: 
                 next_phrase_words = [lm.end_string()]
             new_phrase_words = new_translation_option[0].split()
             old_words_to_score = prev_phrase_words + current_phrase_words + next_phrase_words
@@ -264,7 +332,7 @@ def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hy
         current_phrase_words = tgt_words[ tgt_from_to[i][0]:tgt_from_to[i][1] ]
         prev_phrase_words = tgt_words[ tgt_from_to[i-1][0]:tgt_from_to[i-1][1] ]
         next_phrase_words = tgt_words[ tgt_from_to[i][1]:tgt_from_to[i][1]+2 ]
-        if len(next_phrase_words) == 0: 
+        if len(next_phrase_words) < 2: 
             next_phrase_words = [lm.end_string()]
         
         # then we determien the text that needs to be rescored with the lm
@@ -441,11 +509,8 @@ for f in input_sents:
                     continue
                 
                 # determine the future cost for this new bit vector
-                if USE_FUTURE_COST:
-                    future_logprob = compute_future_logprob(new_bit_array, span_future_logprob)
-                else:
-                    future_logprob = 0.0
-
+                future_logprob = FUTURE_COST * compute_future_logprob(new_bit_array, span_future_logprob)
+                
                 # for each possible phrase translation
                 for phrase in tm[f[fromIndex:toIndex]]:
                     # adjust future_logprob
