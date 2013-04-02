@@ -11,27 +11,32 @@ from marginalize import marginalize
 parser = argparse.ArgumentParser(description='Simple phrase based decoder.')
 parser.add_argument('-i', '--input', dest='input', default='data/input', help='File containing sentences to translate (default=data/input)')
 parser.add_argument('-t', '--translation-model', dest='tm', default='data/tm', help='File containing translation model (default=data/tm)')
-parser.add_argument('-s', '--stack-size', dest='s', default=50, type=int, help='Maximum stack size (default=1)')
+parser.add_argument('-s', '--stack-size', dest='s', default=500, type=int, help='Maximum stack size (default=1)')
 parser.add_argument('-n', '--num_sentences', dest='num_sents', default=sys.maxint, type=int, help='Number of sentences to decode (default=no limit)')
 parser.add_argument('-l', '--language-model', dest='lm', default='data/lm', help='File containing ARPA-format language model (default=data/lm)')
 parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', default=False,  help='Verbose mode (default=off)')
 opts = parser.parse_args()
 
+EPSILON = 0.01
 # penalize the use of an empty translation, but still allow it in case of OOVs
 LOGPROB_OF_EMPTY_TRANSLATION = -20.0
 EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRANSLATION)
 # distortion
-DISTORTION_PENALTY = 1.5
-DISTORTION_THRESHOLD = 5
+DISTORTION_PENALTY = 0.1
+DISTORTION_THRESHOLD = 9
 # prune the phrase table
-MAX_PHRASE_OPTIONS = 20
+MAX_PHRASE_OPTIONS = 45
 # brevity penalty
 BREVITY_PENALTY = 0.0
 # modifications for the best complete hypothesis in the stack decoder
-USE_SWAPS = False
+USE_SWAPS = True
 USE_SPLITS = True
 USE_MERGES = True
 USE_RETRANSLATES = True
+USE_TWO_EDITS = False
+TOP_K_OF_FIRST_EDIT = 12
+MAX_ITERATIVE_EDITS = 3
+MAX_NON_GREADY_EDITS = 10
 MOST_GREEDY = False
 # future cost
 FUTURE_COST = 1.0
@@ -76,8 +81,78 @@ def get_phrase_pairs(h, phrase_pairs):
         phrase_pairs.insert(0, (src_phrase, h.phrase) )
         get_phrase_pairs(h.predecessor, phrase_pairs)
 
+# nicely print a complete hypothesis tuple ( logprob, [  phrase-pair-1, phrase-pair-2, ... ] )
+# where phrase-pair-i is a tuple  (  (from_src_pos, to_src_pos), (tgt_string, tm_logprob)  )
+def nice_print(hyp_tuple):
+    sys.stderr.write('\n~~~~~~~~~~~~~~~~~~~~~\nlogprob={0}\n'.format(hyp_tuple[0]))
+    sys.stderr.write('phrase_count={0}\n'.format(len(hyp_tuple[1])))
+    for i in range(0, len(hyp_tuple[1])):
+        sys.stderr.write('phrase {0}: src_span({1}, {2}), tgt_string={3}, tm_logprob={4}\n'.format(i, 
+                                                                                                   hyp_tuple[1][i][0][0],
+                                                                                                   hyp_tuple[1][i][0][1],
+                                                                                                   hyp_tuple[1][i][1][0],
+                                                                                                   hyp_tuple[1][i][1][1]))
+    sys.stderr.write('~~~~~~~~~~~~~~~~~~~~~\n\n')
+
+# extract the sentence translation from a hypothesis tuple
+def extract_translation(phrase_pairs):
+    tgt_phrases = []
+    for pair in phrase_pairs:
+        tgt_phrases.append(pair[1][0])
+    translation = ' '.join(tgt_phrases)
+    return translation
+
+# find all ways to make two edits 
+def get_all_two_edits(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+    # list all distance-1 edits
+    dist1_edits = []
+    if USE_RETRANSLATES:
+        dist1_edits += get_all_retranslations(f, original_phrase_pairs, original_logprob, False, verbose=False)
+    if USE_SWAPS:
+        dist1_edits += get_all_swaps(original_phrase_pairs, original_logprob, False, verbose=False)
+    if USE_SPLITS:
+        dist1_edits += get_all_splits(f, original_phrase_pairs, original_logprob, False, verbose=False)
+    if USE_MERGES:
+        dist1_edits += get_all_merges(f, original_phrase_pairs, original_logprob, False, verbose=False)
+
+    for i in range(0, MAX_NON_GREADY_EDITS):
+        # prune the list of distance-1 edits
+        dist1_edits = sorted(dist1_edits, reverse=True)[:TOP_K_OF_FIRST_EDIT]
+    
+        # list good distance-2 edits, by extending each distance-1 edit
+        dist2_edits = []
+        for edit in dist1_edits:
+            if USE_RETRANSLATES:
+                dist2_edits += get_all_retranslations(f, edit[1], edit[0], only_return_better_hypotheses)
+            if USE_SWAPS:
+                dist2_edits += get_all_swaps(edit[1], edit[0], only_return_better_hypotheses)
+            if USE_SPLITS:
+                dist2_edits += get_all_splits(f, edit[1], edit[0], only_return_better_hypotheses)
+            if USE_MERGES:
+                dist2_edits += get_all_merges(f, edit[1], edit[0], only_return_better_hypotheses)
+    
+        # remove duplicates
+        dist2_edits = sorted(dist2_edits, reverse=True)
+        
+        # two edits can potentially bring back the original hypothesis. exclude this possibility
+        # also, remove hypotheses which have an identical score
+        for i in range(0, len(dist2_edits)):
+            if i >= len(dist2_edits):
+                break
+            if i > 0 and abs(dist2_edits[i-1][0] - dist2_edits[i][0]) < EPSILON:
+                del dist2_edits[i]
+            if tuple(edit[1]) == tuple(original_phrase_pairs):
+                del dist2_edits[i]
+                
+        # in case we want to continue doing this game
+        dist1_edits = list(dist2_edits)
+
+    if len(dist2_edits) > 0 and only_return_better_hypotheses:
+        sys.stderr.write('{0} good dist-2-edits found'.format(len(dist2_edits)))
+    return dist2_edits
+
 # find all ways to retranslate one of the src phrase
-def get_all_retranslations(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+def get_all_retranslations(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True, verbose=True):
     # populate the two lists:
     # tgt_from_to = [ (tgt_pos_from, tgt_pos_to), (tgt_pos_from, tgt_pos_to), ... ]
     # tgt_words = [ e1, e2, e3, ... ]
@@ -144,13 +219,13 @@ def get_all_retranslations(f, original_phrase_pairs, original_logprob, only_retu
                 if MOST_GREEDY:
                     return retranslations
 
-    if len(retranslations) > 0:
+    if len(retranslations) > 0 and only_return_better_hypotheses and verbose:
         sys.stderr.write('{0} re-translations are better than original\n'.format(len(retranslations)))
     return retranslations
 
         
 # find all ways to split a phrase pair into two
-def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True, verbose=True):
     # populate the two lists:
     # tgt_from_to = [ (tgt_pos_from, tgt_pos_to), (tgt_pos_from, tgt_pos_to), ... ]
     # tgt_words = [ e1, e2, e3, ... ]
@@ -222,12 +297,12 @@ def get_all_splits(f, original_phrase_pairs, original_logprob, only_return_bette
                         if MOST_GREEDY:
                             return splits
 
-    if len(splits) > 0:
+    if len(splits) > 0 and only_return_better_hypotheses and verbose:
         sys.stderr.write('{0} splits are better than original\n'.format(len(splits)))
     return splits
 
 # find all ways to merge two consecutive phrase pairs
-def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_better_hypotheses=True, verbose=True):
     # populate the two lists:
     # tgt_from_to = [ (tgt_pos_from, tgt_pos_to), (tgt_pos_from, tgt_pos_to), ... ]
     # tgt_words = [ e1, e2, e3, ... ]
@@ -293,12 +368,12 @@ def get_all_merges(f, original_phrase_pairs, original_logprob, only_return_bette
                 if MOST_GREEDY:
                     return merges
 
-    if len(merges) > 0:
+    if len(merges) > 0 and only_return_better_hypotheses and verbose:
         sys.stderr.write('{0} merges are better than original\n'.format(len(merges)))
     return merges
 
 # find all swaps and compute the logprob of the resulting complete hypothesis
-def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hypotheses=True):
+def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hypotheses=True, verbose=True):
     # populate the two lists:
     # tgt_from_to = [ (tgt_pos_from, tgt_pos_to), (tgt_pos_from, tgt_pos_to), ... ]
     # tgt_words = [ e1, e2, e3, ... ]
@@ -317,7 +392,7 @@ def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hy
     # swaps look like this:
     # swaps = [  (score, phrase_pairs_ala_get_phrase_pairs), ... ]
     swaps = []
-    for i in range(1, len(original_phrase_pairs)):
+    for i in range(1, len(original_phrase_pairs)-1):
         # swap phrases i and i-1 in new_phrase_pairs
         new_phrase_pairs = list(original_phrase_pairs)
         new_phrase_pairs[i] = original_phrase_pairs[i-1]
@@ -349,7 +424,7 @@ def get_all_swaps(original_phrase_pairs, original_logprob, only_return_better_hy
             if MOST_GREEDY:
                 return swaps
     
-    if len(swaps) > 0:
+    if len(swaps) > 0 and only_return_better_hypotheses and verbose:
         sys.stderr.write('{0} swaps are better than original\n'.format(len(swaps)))
     return swaps
 
@@ -361,21 +436,27 @@ def edit_complete_hypothesis(f, winner_tuple):
     # create the list of all possible edits
     edits = [winner_tuple]
 
-    # add all possible swaps
+    # add all good swaps
     if USE_SWAPS:
         edits += get_all_swaps(original_phrase_pairs, original_logprob)
 
-    # add all possible merges
+    # add all good merges
     if USE_MERGES:
         edits += get_all_merges(f, original_phrase_pairs, original_logprob)
 
-    # add all possible splits
+    # add all good splits
     if USE_SPLITS:
         edits += get_all_splits(f, original_phrase_pairs, original_logprob)
 
-    # add all possible translation change
+    # add all good translation change
     if USE_RETRANSLATES:
         edits += get_all_retranslations(f, original_phrase_pairs, original_logprob)
+
+    # add all good changes with edit-distance of 2
+    if USE_TWO_EDITS:
+        edits += get_all_two_edits(f, original_phrase_pairs, original_logprob)
+
+    #marginal_logprob = marginalize(f, extract_translation(winner_tuple[1]), lm, tm)
 
     # find the best edit
     best_edit = max(edits)
@@ -575,16 +656,24 @@ for f in input_sents:
     original_phrase_pairs = []
     get_phrase_pairs(winner, original_phrase_pairs)
     winner_tuple = (winner.logprob, original_phrase_pairs)
-   
+    marginal_logprob = marginalize(f, extract_translation(winner_tuple[1]), lm, tm)
+	
     # keep modifying the best hypothesis until you can't improve it anymore
     prev_logprob = winner.logprob - 1
     sys.stderr.write('===========================\n try to improve the best hypothesis by editing it\n\n')
-    while winner_tuple[0] > prev_logprob:
-        sys.stderr.write('winner = {0}\n\n'.format(winner_tuple))
+    edits_count = 0
+    while winner_tuple[0] > prev_logprob + EPSILON and edits_count < MAX_ITERATIVE_EDITS:
+        edits_count += 1
+        nice_print(winner_tuple)
 	prev_logprob = winner_tuple[0]
-        sys.stderr.write('logprob = {0}\n'.format(prev_logprob))
-	winner_tuple = edit_complete_hypothesis(f, winner_tuple)
-    sys.stderr.write('done\n---------------------------\n')
+        potential_winner_tuple = edit_complete_hypothesis(f, winner_tuple)
+        potential_marginal_logprob = marginalize(f, extract_translation(potential_winner_tuple[1]), lm, tm)
+        if potential_marginal_logprob <= marginal_logprob:
+            break
+        else:
+            winner_tuple = potential_winner_tuple
+
+    sys.stderr.write('\ndone\n---------------------------\n')
 	
     # now extract the target translation
     (winner_logprob, winner_phrase_pairs) = winner_tuple
@@ -596,14 +685,14 @@ for f in input_sents:
     # if you use an empty phrase
     if translation.find('MANAAL_WALEED') != -1:
         sys.exit(1)
-        sys.stderr.write('decoder1: {0} <<{1:.2f}>> final_stack_size={2}\n'.format(translation, best_logprob, len(stacks[-1])))
+        sys.stderr.write('decoder1: {0} <<{1:.2f}>>\n'.format(translation, best_logprob))
         winner = baseline_decode(f)
         translation = extract_english_recursive(winner)
         sys.stderr.write('decoder2: {0} <<{1:.2f}>>\n=========\n'.format(translation, winner.logprob))
     else:
-        sys.stderr.write('decoder1: {0} <<{1:.2f}>> final_stack_size={2}\n'.format(translation, winner_logprob, len(stacks[-1])))
+        sys.stderr.write('decoder1: {0}  <<{1:.2f}>>\n'.format(translation, winner_logprob))
         temp_translation = extract_english_recursive(winner)
-        sys.stderr.write('decoder3: {0} <<{1:.2f}>> final_stack_size={2}\n'.format(temp_translation, winner.logprob, len(stacks[-1])))
+        sys.stderr.write('decoder3: {0} <<{1:.2f}>>\n'.format(temp_translation, winner.logprob))
         baselineWinner = baseline_decode(f)
         baselineTranslation = extract_english_recursive(baselineWinner)
         sys.stderr.write('decoder0: {0} <<{1:.2f}>>\n=========\n'.format(baselineTranslation, baselineWinner.logprob))
