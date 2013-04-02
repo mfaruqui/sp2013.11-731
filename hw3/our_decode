@@ -23,9 +23,9 @@ LOGPROB_OF_EMPTY_TRANSLATION = -20.0
 EMPTY_TGT_PHRASE = phrase(english='MANAAL_WALEED', logprob=LOGPROB_OF_EMPTY_TRANSLATION)
 # distortion
 DISTORTION_PENALTY = 0.1
-DISTORTION_THRESHOLD = 9
+DISTORTION_THRESHOLD = 12
 # prune the phrase table
-MAX_PHRASE_OPTIONS = 45
+MAX_PHRASE_OPTIONS = 50
 # brevity penalty
 BREVITY_PENALTY = 0.0
 # modifications for the best complete hypothesis in the stack decoder
@@ -34,7 +34,7 @@ USE_SPLITS = True
 USE_MERGES = True
 USE_RETRANSLATES = True
 USE_TWO_EDITS = False
-TOP_K_OF_FIRST_EDIT = 12
+TOP_K_OF_FIRST_EDIT = 20
 MAX_ITERATIVE_EDITS = 3
 MAX_NON_GREADY_EDITS = 10
 MOST_GREEDY = False
@@ -456,8 +456,11 @@ def edit_complete_hypothesis(f, winner_tuple):
     if USE_TWO_EDITS:
         edits += get_all_two_edits(f, original_phrase_pairs, original_logprob)
 
-    #marginal_logprob = marginalize(f, extract_translation(winner_tuple[1]), lm, tm)
-
+    # replace the logprobs with marginal logprobs
+    for i in range(0, len(edits)):
+        marginal_logprob = marginalize(f, extract_translation(edits[i][1]), lm, tm)
+        edits[i] = ( marginal_logprob, edits[i][1] )
+    
     # find the best edit
     best_edit = max(edits)
 
